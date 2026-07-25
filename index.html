@@ -304,6 +304,8 @@ html[dir="rtl"] .chat-drawer{right:auto;left:0;box-shadow:12px 0 32px rgba(0,0,0
 .key-link:hover{text-decoration:underline;}
 .key-clear{display:none;width:100%;background:transparent;border:none;color:var(--tier-verylow);font-size:11.5px;padding:6px;cursor:pointer;}
 .key-clear.show{display:block;}
+.key-diag{font-size:11px;color:var(--sub-text);background:var(--paper-2);border-radius:6px;padding:8px 10px;margin-top:10px;display:none;word-break:break-word;font-family:var(--font-mono);}
+.key-diag.show{display:block;}
 .chat-log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;}
 .msg{max-width:88%;padding:10px 13px;border-radius:11px;font-size:13.5px;line-height:1.55;}
 .msg.user{align-self:flex-end;background:var(--teal);color:#fff;border-bottom-right-radius:3px;}
@@ -422,6 +424,7 @@ html[dir="rtl"] .suggest-row button{text-align:right;}
       </div>
       <a class="key-link" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" data-i="keyLink">Get an API key from console.anthropic.com →</a>
       <button class="key-clear" id="key-clear" onclick="clearKey()" data-i="keyClear">Remove saved key</button>
+      <div class="key-diag" id="key-diag"></div>
     </div>
   </div>
 
@@ -482,7 +485,6 @@ const STRINGS = {
     s2:'Customer wants to cancel, captain is not answering — steps?',
     s3:'What counts as a Level 1 safety incident?',
     chatError:'Something went wrong reaching the assistant. Please try again.',
-    chatErrorAuth:'That API key was rejected. Check it and save again.',
     askAboutThis:'Ask about SOP',
     keyTitle:'Connect your Anthropic API key',
     keyBody:'This is a standalone file — it calls Claude directly from your browser, so it needs your own API key. It\'s stored only in this browser (localStorage) and sent only to Anthropic\'s API, never anywhere else.',
@@ -503,7 +505,6 @@ const STRINGS = {
     s2:'العميل يريد الإلغاء، والكابتن لا يجيب — ما الخطوات؟',
     s3:'ما الذي يُعتبر حادثة سلامة من المستوى الأول؟',
     chatError:'حدث خطأ أثناء التواصل مع المساعد. حاول مرة أخرى.',
-    chatErrorAuth:'تم رفض مفتاح API هذا. تحقق منه واحفظه مرة أخرى.',
     askAboutThis:'اسأل عن الإجراء',
     keyTitle:'اربط مفتاح Anthropic API الخاص بك',
     keyBody:'هذا ملف مستقل — يتصل بـ Claude مباشرة من متصفحك، لذا يحتاج مفتاح API خاص بك. يُحفظ فقط في هذا المتصفح (localStorage) ويُرسل فقط إلى واجهة Anthropic، ولا يُرسل لأي جهة أخرى.',
@@ -730,12 +731,15 @@ function syncKeyDot(){
   const dot = document.getElementById('key-dot');
   if(dot) dot.classList.toggle('set', !!apiKey);
 }
-function openKeyPanel(){
+function openKeyPanel(diag){
   const panel = document.getElementById('key-panel');
   panel.classList.add('show');
   document.getElementById('key-input').value = apiKey;
   document.getElementById('key-cancel').style.display = apiKey ? '' : 'none';
   document.getElementById('key-clear').classList.toggle('show', !!apiKey);
+  const diagEl = document.getElementById('key-diag');
+  if(diag){ diagEl.textContent = diag; diagEl.classList.add('show'); }
+  else{ diagEl.classList.remove('show'); diagEl.textContent=''; }
   setTimeout(()=>document.getElementById('key-input').focus(), 50);
 }
 function closeKeyPanel(){
@@ -812,8 +816,9 @@ async function sendChat(){
   const sys = buildSystemPrompt();
   const apiMessages = hist.filter(m=>!m.error).map(m=>({role:m.role, content:m.content}));
 
+  let response;
   try{
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST",
       headers:{
         "Content-Type":"application/json",
@@ -828,21 +833,35 @@ async function sendChat(){
         messages: apiMessages
       })
     });
-    if(response.status===401 || response.status===403){
-      hist.push({role:'assistant', content: STRINGS[state.lang].chatErrorAuth, error:true});
-      state.sending=false; renderChatLog();
-      openKeyPanel();
-      return;
-    }
-    const data = await response.json();
-    let text = '';
-    if(data && data.content){
-      text = data.content.map(b=> b.type==='text' ? b.text : '').filter(Boolean).join('\n');
-    }
-    if(!text){ throw new Error(data && data.error && data.error.message || 'empty'); }
-    hist.push({role:'assistant', content:text, html: simpleMarkdown(text)});
-  }catch(e){
+  }catch(networkErr){
+    // fetch() throws (not an HTTP error) on network/CORS failure — this is
+    // the classic symptom of opening the file as file:// instead of http(s).
     hist.push({role:'assistant', content: STRINGS[state.lang].chatError, error:true});
+    state.sending = false; renderChatLog();
+    const isFile = location.protocol === 'file:';
+    openKeyPanel((isFile ? '⚠ Page is running from file://, which Anthropic\'s API blocks. Serve this file over http(s) (e.g. "python3 -m http.server" then open http://localhost:8000, or host it on GitHub Pages) and try again.\n\n' : '') + 'Network error: ' + networkErr.message);
+    return;
+  }
+
+  let data = null;
+  try{ data = await response.json(); }catch(e){ /* non-JSON body */ }
+
+  if(!response.ok){
+    const msg = (data && data.error && data.error.message) || (response.status + ' ' + response.statusText);
+    hist.push({role:'assistant', content: STRINGS[state.lang].chatError, error:true});
+    state.sending = false; renderChatLog();
+    openKeyPanel('API error (' + response.status + '): ' + msg);
+    return;
+  }
+
+  let text = '';
+  if(data && data.content){
+    text = data.content.map(b=> b.type==='text' ? b.text : '').filter(Boolean).join('\n');
+  }
+  if(!text){
+    hist.push({role:'assistant', content: STRINGS[state.lang].chatError, error:true});
+  }else{
+    hist.push({role:'assistant', content:text, html: simpleMarkdown(text)});
   }
   state.sending = false;
   renderChatLog();
